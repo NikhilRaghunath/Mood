@@ -1,24 +1,3 @@
-# -*- coding: utf-8 -*-
-import os
-import time
-import numpy as np
-import datetime
-import tqdm
-from sklearn import metrics
-import pickle
-import csv
-
-import torch
-import torch.nn as nn
-
-from model import CNN
-from model import FCN5
-from model import AResNet
-from model import AResNet_Residual
-from model import CNN_SMALL
-from model import CNN_Plain
-from model import AudioNet
-
 import os
 import time
 import numpy as np

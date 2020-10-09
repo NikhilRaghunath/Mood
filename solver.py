@@ -72,7 +72,7 @@ class Solver():
             ctr = 0
             step_loss = 0
             epoch_loss = 0
-            for i1, i2 in zip(self.data_loader1, self.data_loader2):
+            for i1, i2 in zip(itertools.repeat(self.data_loader1, self.data_loader2)):
                 ctr += 1
 
                 # mixup---------

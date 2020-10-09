@@ -19,63 +19,50 @@ from model import CNN_SMALL
 from model import CNN_Plain
 from model import AudioNet
 
-class Solver(object):
-    def __init__(self, data_loader, valid_loader, config):
+import os
+import time
+import numpy as np
+import datetime
+import tqdm
+from sklearn import metrics
+import pickle
+import csv
+
+import torch
+import torch.nn as nn
+from torch.utils.tensorboard import SummaryWriter
+
+from model import MusicSelfAttModel
+
+class Solver():
+    def __init__(self, data_loader1, data_loader2, valid_loader, tag_list, config):
         # Data loader
-        self.data_loader = data_loader
+        self.data_loader1 = data_loader1
+        self.data_loader2 = data_loader2
         self.valid_loader = valid_loader
 
         # Training settings
-        self.n_epochs = 500
+        self.n_epochs = 120
         self.lr = 1e-4
-        self.log_step = 30
+        self.log_step = 100
         self.is_cuda = torch.cuda.is_available()
-        self.model_save_path = config.model_save_path
-        self.batch_size = config.batch_size
-        self.tag_list = self.get_tag_list(config)
-        if config.subset == 'all':
-            self.num_class = 183
-        elif config.subset == 'genre':
-            self.num_class = 87
-            self.tag_list = self.tag_list[:87]
-        elif config.subset == 'instrument':
-            self.num_class = 40
-            self.tag_list = self.tag_list[87:127]
-        elif config.subset == 'moodtheme':
-            self.num_class = 56
-            self.tag_list = self.tag_list[127:]
-        elif config.subset == 'top50tags':
-            self.num_class = 50
+        self.model_save_path = config['log_dir']
+        self.batch_size = config['batch_size']
+        self.tag_list = tag_list
+        self.num_class = 56
+        self.writer = SummaryWriter(config['log_dir'])
         self.model_fn = os.path.join(self.model_save_path, 'best_model.pth')
-        self.roc_auc_fn = os.path.join(self.model_save_path, 'roc_auc_'+config.subset+'_'+str(config.split)+'.npy')
-        self.pr_auc_fn = os.path.join(self.model_save_path, 'pr_auc_'+config.subset+'_'+str(config.split)+'.npy')
-        self.prd_fn = os.path.join(self.model_save_path, 'prd.npy')
-        self.song_list_fn = os.path.join(self.model_save_path, 'song_list.npy')
 
         # Build model
-        self.build_model(config.model_name)
+        self.build_model()
 
-    def build_model(self, model_name):
+    def build_model(self):
         # model and optimizer
-        if model_name == "CNN":
-            model = CNN(num_class=self.num_class)
-        elif model_name == "FCN5":
-            model = FCN5(num_class=self.num_class)
-        elif model_name == "AResNet":
-            model = AResNet(num_class=self.num_class)
-        elif model_name == "AResNet_Residual":
-            model = AResNet_Residual(num_class=self.num_class)
-        elif model_name == "CNN_SMALL":
-            model = CNN_SMALL(num_class=self.num_class)
-        elif model_name == "CNN_Plain":
-            model = CNN_Plain(num_class=self.num_class)
-        elif model_name == "AudioNet":
-            model = AudioNet(num_class=self.num_class)
+        model = MusicSelfAttModel()
 
         if self.is_cuda:
             self.model = model
             self.model.cuda()
-            #self.model = torch.nn.DataParallel(self.model)
         self.optimizer = torch.optim.Adam(self.model.parameters(), self.lr)
 
     def load(self, filename):
@@ -98,25 +85,39 @@ class Solver(object):
         drop_counter = 0
         reconst_loss = nn.BCELoss()
 
-        max_point = 0
-        last_roc_auc = 0
-        roc_auc_dec = 0
-
         for epoch in range(self.n_epochs):
+            print('Training')
             drop_counter += 1
             # train
             self.model.train()
             ctr = 0
-            for x, y, _ in self.data_loader:
+            step_loss = 0
+            epoch_loss = 0
+            for i1, i2 in zip(self.data_loader1, self.data_loader2):
                 ctr += 1
 
+                # mixup---------
+                alpha = 1
+                mixup_vals = np.random.beta(alpha, alpha, i1[0].shape[0])
+                
+                lam = torch.Tensor(mixup_vals.reshape(mixup_vals.shape[0], 1, 1, 1))
+                inputs = (lam * i1[0]) + ((1 - lam) * i2[0])
+                
+                lam = torch.Tensor(mixup_vals.reshape(mixup_vals.shape[0], 1))
+                labels = (lam * i1[1]) + ((1 - lam) * i2[1])
+
                 # variables to cuda
-                x = self.to_var(x)
-                y = self.to_var(y)
+                x = self.to_var(inputs)
+                y = self.to_var(labels)
 
                 # predict
-                out = self.model(x)
-                loss = reconst_loss(out, y)
+                att,clf = self.model(x)
+                loss1 = reconst_loss(att, y)
+                loss2 = reconst_loss(clf,y)
+                loss = (loss1+loss2)/2
+
+                step_loss += loss.item()
+                epoch_loss += loss.item()
 
                 # back propagation
                 self.optimizer.zero_grad()
@@ -127,28 +128,24 @@ class Solver(object):
                 if (ctr) % self.log_step == 0:
                     print("[%s] Epoch [%d/%d] Iter [%d/%d] train loss: %.4f Elapsed: %s" %
                             (datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                            epoch+1, self.n_epochs, ctr, len(self.data_loader), loss.item(),
+                            epoch+1, self.n_epochs, ctr, len(self.data_loader1), (step_loss/self.log_step),
                             datetime.timedelta(seconds=time.time()-start_t)))
+                    step_loss = 0
+
+            self.writer.add_scalar('Loss/train', epoch_loss/len(self.data_loader1), epoch)
 
             # validation
-            if epoch % 5 == 0:
-                roc_auc, _ = self._validation(start_t, epoch)
+            roc_auc, _ = self._validation(start_t, epoch)
 
-                # save model
-                if roc_auc > best_roc_auc:
-                    print('best model: %4f' % roc_auc)
-                    max_point = 1
-                    best_roc_auc = roc_auc
-                    torch.save(self.model.state_dict(), os.path.join(self.model_save_path, 'best_model.pth'))
-                
-                if roc_auc < last_roc_auc:
-                    roc_auc_dec += 1
-                    if max_point == 1 and roc_auc_dec >= 10:
-                        break
-                else:
-                    max_point = 0
-                    roc_auc_dec = 0
-                last_roc_auc = roc_auc
+            # save model
+            if roc_auc > best_roc_auc:
+                print('best model: %4f' % roc_auc)
+                best_roc_auc = roc_auc
+                torch.save(self.model.state_dict(), os.path.join(self.model_save_path, 'best_model.pth'))
+
+            if epoch%10 ==0:
+                print(f'Saving model at epoch {epoch}')
+                torch.save(self.model.state_dict(), os.path.join(self.model_save_path, f'model_epoch_{epoch}.pth'))
 
             # schedule optimizer
             current_optimizer, drop_counter = self._schedule(current_optimizer, drop_counter)
@@ -158,12 +155,13 @@ class Solver(object):
                     datetime.timedelta(seconds=time.time() - start_t)))
 
     def _validation(self, start_t, epoch):
-        prd_array = []  # prediction
+        prd1_array = []  # prediction
+        prd2_array = []
         gt_array = []   # ground truth
         ctr = 0
         self.model.eval()
         reconst_loss = nn.BCELoss()
-        for x, y, _ in self.valid_loader:
+        for x, y in self.valid_loader:
             ctr += 1
 
             # variables to cuda
@@ -171,47 +169,47 @@ class Solver(object):
             y = self.to_var(y)
 
             # predict
+            att,clf = self.model(x)
+            loss1 = reconst_loss(att, y)
+            loss2 = reconst_loss(clf,y)
+            loss = (loss1+loss2)/2
 
-            #out = self.model(x)
-            #loss = reconst_loss(out, y)
-
-            batch_size, n_crops, melbins, size = x.size()
-            x = x.view(batch_size * n_crops, melbins, size)
-            out = self.model(x)
-            out = out.view(batch_size, n_crops, -1)
-            out = torch.mean(out, 1)
-            loss = reconst_loss(out, y)
-
-            '''
             # print log
             if (ctr) % self.log_step == 0:
                 print("[%s] Epoch [%d/%d], Iter [%d/%d] valid loss: %.4f Elapsed: %s" %
                         (datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                         epoch+1, self.n_epochs, ctr, len(self.valid_loader), loss.item(),
                         datetime.timedelta(seconds=time.time()-start_t)))
-            '''
 
             # append prediction
-            out = out.detach().cpu()
+            att = att.detach().cpu()
+            clf = clf.detach().cpu()
             y = y.detach().cpu()
-            for prd in out:
-                prd_array.append(list(np.array(prd)))
+            for prd1 in att:
+                prd1_array.append(list(np.array(prd1)))
+            for prd2 in clf:
+                prd2_array.append(list(np.array(prd2)))
             for gt in y:
                 gt_array.append(list(np.array(gt)))
 
+        val_loss1 = reconst_loss(torch.Tensor(prd1_array), torch.Tensor(gt_array))
+        val_loss2 = reconst_loss(torch.Tensor(prd2_array), torch.Tensor(gt_array))
+        print(f'Val Loss: {val_loss1}, {val_loss2}')
+        self.writer.add_scalar('Loss/val1', val_loss1, epoch)
+        self.writer.add_scalar('Loss/val2', val_loss2, epoch)
+
         # get auc
-        roc_auc, pr_auc, _, _ = self.get_auc(prd_array, gt_array)
-        return roc_auc, pr_auc
+        list_all = True if epoch==self.n_epochs else False
 
-    def get_tag_list(self, config):
-        if config.subset == 'top50tags':
-            path = 'tag_list_50.npy'
-        else:
-            path = 'tag_list.npy'
-        tag_list = np.load(path)
-        return tag_list
+        roc_auc1, pr_auc1, _, _ = self.get_auc(prd1_array, gt_array, list_all)
+        roc_auc2, pr_auc2, _, _ = self.get_auc(prd2_array, gt_array, list_all)
+        self.writer.add_scalar('AUC/ROC2', roc_auc1, epoch)
+        self.writer.add_scalar('AUC/PR2', pr_auc1, epoch)
+        self.writer.add_scalar('AUC/ROC2', roc_auc2, epoch)
+        self.writer.add_scalar('AUC/PR2', pr_auc2, epoch)
+        return roc_auc1, pr_auc1
 
-    def get_auc(self, prd_array, gt_array):
+    def get_auc(self, prd_array, gt_array, list_all=False):
         prd_array = np.array(prd_array)
         gt_array = np.array(gt_array)
 
@@ -224,8 +222,10 @@ class Solver(object):
         roc_auc_all = metrics.roc_auc_score(gt_array, prd_array, average=None)
         pr_auc_all = metrics.average_precision_score(gt_array, prd_array, average=None)
 
-        for i in range(self.num_class):
-            print('%s \t\t %.4f , %.4f' % (self.tag_list[i], roc_auc_all[i], pr_auc_all[i]))
+        if list_all==True:            
+            for i in range(self.num_class):
+                print('%s \t\t %.4f , %.4f' % (self.tag_list[i], roc_auc_all[i], pr_auc_all[i]))
+        
         return roc_aucs, pr_aucs, roc_auc_all, pr_auc_all
 
     def _schedule(self, current_optimizer, drop_counter):
@@ -262,8 +262,7 @@ class Solver(object):
         ctr = 0
         prd_array = []  # prediction
         gt_array = []   # ground truth
-        song_array = [] # song array
-        for x, y, fn in self.data_loader:
+        for x, y in self.data_loader1:
             ctr += 1
 
             # variables to cuda
@@ -271,18 +270,15 @@ class Solver(object):
             y = self.to_var(y)
 
             # predict
-            batch_size, n_crops, melbins, size = x.size()
-            x = x.view(batch_size * n_crops, melbins, size)
-            out = self.model(x)
-            out = out.view(batch_size, n_crops, -1)
-            out = torch.mean(out, 1)
+            out1, out2 = self.model(x)
+            out = (out1+out2)/2
             loss = reconst_loss(out, y)
 
             # print log
             if (ctr) % self.log_step == 0:
                 print("[%s] Iter [%d/%d] test loss: %.4f Elapsed: %s" %
                         (datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                        ctr, len(self.data_loader), loss.item(),
+                        ctr, len(self.data_loader1), loss.item(),
                         datetime.timedelta(seconds=time.time()-start_t)))
 
             # append prediction
@@ -292,14 +288,15 @@ class Solver(object):
                 prd_array.append(list(np.array(prd)))
             for gt in y:
                 gt_array.append(list(np.array(gt)))
-            for song in fn:
-                song_array.append(song)
+
+        #np.save('./pred_array.npy', np.array(prd_array))
+        #np.save('./gt_array.npy', np.array(gt_array))
 
         # get auc
         roc_auc, pr_auc, roc_auc_all, pr_auc_all = self.get_auc(prd_array, gt_array)
 
+        return (np.array(prd_array), np.array(gt_array), roc_auc, pr_auc)
+
         # save aucs
-        np.save(open(self.roc_auc_fn, 'wb'), roc_auc_all)
-        np.save(open(self.pr_auc_fn, 'wb'), pr_auc_all)
-        np.save(open(self.prd_fn, 'wb'), prd_array)
-        np.save(open(self.song_list_fn, 'wb'), song_array)
+        #np.save(open(self.roc_auc_fn, 'wb'), roc_auc_all)
+        #np.save(open(self.pr_auc_fn, 'wb'), pr_auc_all)

@@ -1,75 +1,88 @@
-import os
-import random
+import os, pickle, csv
 import numpy as np
-import pickle
+import torch
 from torch.utils import data
+from transforms import get_transforms
 
-def random_crop(size):
-    def f(sound):
-        org_size = sound.shape[1]
-        start = random.randint(0, org_size - size)
-        return sound[:, start: start + size]
-    return f
-
-def multi_crop(size, n_crops):
-    def f(sound):
-        sounds = np.zeros((n_crops, 96, size))
-        org_size = sound.shape[1]
-        stride = (org_size - size) // (n_crops - 1)
-        for i in range(n_crops):
-            sounds[i] = sound[:, stride * i : stride * i + size]
-        return sounds
-    return f
+def get_spectogram(full_spect, size=1400):
+    full_len = full_spect.shape[1]
+    if full_len > size:
+        audio = full_spect[:, :size]
+    else:
+        diff = size-full_len
+        audio = full_spect
+        while(diff > 0):
+            if diff>full_len:
+                audio = np.concatenate((audio,full_spect), axis=1)
+                diff = diff-full_len
+            else:
+                audio = np.concatenate((audio, full_spect[:,:diff]), axis=1)
+                diff = 0                
+    return audio
 
 class AudioFolder(data.Dataset):
-    def __init__(self, bc_learning, root, subset, tr_val='train', split=0, segment_length=1366):
-        self.bc_learning = (bc_learning and tr_val == 'train')
+    def __init__(self, root, tsv_path, labels_to_idx, num_classes=56, spect_len=4096, train=True):
+        self.train = train
         self.root = root
-        self.tr_val = tr_val
-        fn = '../data/splits/split-%d/%s_%s_dict.pickle' % (split, subset, tr_val)
-        self.get_dictionary(fn)
-
-        val_seg = 10
-        test_seg = val_seg * 2
-        if tr_val == 'train':
-            self.func = random_crop(segment_length)
-        elif tr_val == 'validation':
-            self.func = multi_crop(segment_length, val_seg)
-            #self.func = random_crop(segment_length)
-        elif tr_val == 'test':
-            self.func = multi_crop(segment_length, test_seg)
+        self.num_classes = num_classes
+        self.spect_len = spect_len
+        self.labels_to_idx = labels_to_idx
+        self.prepare_data(tsv_path)
+        if train:
+            self.transform = get_transforms(
+                                train=True,
+                                size=spect_len,
+                                wrap_pad_prob=0.5,
+                                resize_scale=(0.8, 1.0),
+                                resize_ratio=(1.7, 2.3),
+                                resize_prob=0.33,
+                                spec_num_mask=2,
+                                spec_freq_masking=0.15,
+                                spec_time_masking=0.20,
+                                spec_prob=0.5
+                            )
+        else:
+            self.transform = get_transforms(False, spect_len)
 
     def __getitem__(self, index):
-        if self.bc_learning is False:
-            fn = os.path.join(self.root, 'download_melspecs', self.dictionary[index]['path'][:-3]+'npy')
-            audio = self.func(np.load(fn))
-            tags = self.dictionary[index]['tags']
-        elif self.bc_learning is True:
-            index1 = random.randint(0, len(self.dictionary) - 1)
-            index2 = random.randint(0, len(self.dictionary) - 1)
-            fn1 = os.path.join(self.root, 'download_melspecs', self.dictionary[index1]['path'][:-3]+'npy')
-            fn2 = os.path.join(self.root, 'download_melspecs', self.dictionary[index2]['path'][:-3]+'npy')
-            audio1 = self.func(np.load(fn1))
-            audio2 = self.func(np.load(fn2))
-            tags1 = self.dictionary[index1]['tags']
-            tags2 = self.dictionary[index2]['tags']
-            r = random.random()
-            audio = r * audio1 + (1 - r) * audio2
-            tags = r * tags1 + (1 - r) * tags2
-
-        return audio.astype('float32'), tags.astype('float32'), self.dictionary[index]['path']
-
-    def get_dictionary(self, fn):
-        with open(fn, 'rb') as pf:
-            dictionary = pickle.load(pf)
-        self.dictionary = dictionary
+        fn = os.path.join(self.root, self.paths[index][:-3]+'npy')
+        full_spect = np.array(np.load(fn))
+        audio = get_spectogram(full_spect, self.spect_len)
+        audio = self.transform(audio)
+        tags = self.tags[index]
+        labels = self.one_hot(tags)
+        return audio, labels
 
     def __len__(self):
-        return len(self.dictionary)
+        return len(self.paths)
+    
+    def one_hot(self, tags):
+        labels = torch.LongTensor(tags)
+        target = torch.zeros(self.num_classes).scatter_(0, labels, 1)
+        return target
+    
+    def prepare_data(self, path_to_tsv):
+    
+        all_dict = {
+        'PATH': [],
+        'TAGS': []
+        }
+        with open(path_to_tsv) as tsvfile:
+            tsvreader = csv.reader(tsvfile, delimiter="\t")
+            next(tsvreader) #Reading the first line
+            for line in tsvreader:
+                all_dict['PATH'].append(line[3])
+                all_dict['TAGS'].append(line[5:])
 
-def get_audio_loader(bc_learning, root, subset, batch_size, segment_length, shuffle, tr_val='train', split=0, num_workers=0):
-    data_loader = data.DataLoader(dataset=AudioFolder(bc_learning, root, subset, tr_val, split, segment_length),
-                                  batch_size = batch_size,
-                                  shuffle = shuffle,
-                                  num_workers=num_workers)
-    return data_loader
+        self.paths = all_dict['PATH']
+        self.tags = [[self.labels_to_idx[j] for j in i if j in self.labels_to_idx.keys()] for i in all_dict['TAGS']]
+
+
+
+def get_audio_loader(root, tsv_path, labels_to_idx, batch_size=16, num_workers=4, shuffle=True, drop_last=True):
+    data_loader = data.DataLoader(dataset=AudioFolder(root, tsv_path, labels_to_idx, num_classes=56, train=True),
+                                  batch_size=batch_size,
+                                  shuffle=shuffle,
+                                  num_workers=num_workers,
+                                  pin_memory=True,
+                                  drop_last=drop_last)

@@ -1,7 +1,7 @@
 from sklearn.metrics import precision_recall_curve
 import numpy as np
 
-from dataloader import get_audio_loader
+from data_loader import get_audio_loader
 from solver import Solver
 from config import CONFIG, DATA_PATH, META_PATH, SPLIT_PATH
 
